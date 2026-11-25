@@ -1,0 +1,29 @@
+---
+# Copy to .github/workflows/sonarcloud.yml in the collection repository and pin
+# the reusable workflow to a release commit SHA.
+#
+# workflow_run always uses this file from the default branch, so changes to it
+# only take effect after they are merged.
+name: SonarCloud
+
+on:
+  # workflow_run is required to access SONAR_TOKEN for fork pull requests. The
+  # reusable workflow never executes code from the analysed commit.
+  workflow_run: # zizmor: ignore[dangerous-triggers]
+    # Must match the name of the caller workflow for units.yml, which uploads the
+    # coverage artifact.
+    workflows:
+      - Units
+    types:
+      - completed
+
+permissions:
+  contents: read # check out the analysed commit
+  actions: read # download artifacts from the triggering run
+  pull-requests: read # look up the pull request to decorate
+
+jobs:
+  sonarcloud:
+    uses: eco-ansible-content/collections-standards/.github/workflows/sonarcloud.yml@0000000000000000000000000000000000000000 # vX.Y.Z
+    secrets:
+      SONAR_TOKEN: ${{ secrets.ANSIBLE_COLLECTIONS_ORG_SONAR_TOKEN_CICD_BOT }}

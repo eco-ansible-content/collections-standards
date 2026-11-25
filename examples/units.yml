@@ -1,0 +1,24 @@
+---
+# Copy to .github/workflows/units.yml in the collection repository and pin
+# the reusable workflow to a release commit SHA.
+#
+# Keep the workflow name "Units": the SonarCloud workflow is triggered by name.
+name: Units
+
+on:
+  push:
+    branches:
+      - main
+      - stable-*
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  units:
+    uses: eco-ansible-content/collections-standards/.github/workflows/units.yml@0000000000000000000000000000000000000000 # vX.Y.Z

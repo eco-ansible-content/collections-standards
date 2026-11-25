@@ -1,0 +1,171 @@
+---
+# Reusable workflow: fork-safe SonarCloud analysis.
+#
+# FLOW
+#   1. The caller's "Units" workflow (units.yml) runs on pull_request/push without
+#      any secrets and uploads the coverage XML and pr-metadata artifacts.
+#   2. The caller's "SonarCloud" workflow is triggered by workflow_run when Units
+#      completes. It runs in the context of the default branch, where the
+#      SONAR_TOKEN secret is available, and calls this workflow.
+#   3. This workflow checks out the analysed commit, downloads the artifacts and
+#      runs the scanner. No code from the checkout is ever executed.
+#
+# HARDENING
+#   - sonar-project.properties is always taken from the default branch, so a pull
+#     request cannot change scanner settings (for example sonar.host.url, which
+#     would leak the token).
+#   - The organization (repository owner) and project key ("<owner>_<repository>")
+#     are passed on the command line, so they cannot be redirected to another project.
+#   - The pull request number comes from an artifact produced by untrusted code;
+#     it is validated and cross-checked against the GitHub API before use.
+#   - Branch names are validated before being passed to the scanner.
+#   - Runs triggered by a schedule are skipped.
+name: SonarCloud
+
+on:
+  workflow_call:
+    secrets:
+      SONAR_TOKEN:
+        description: SonarCloud token.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  sonarcloud:
+    name: SonarCloud scan
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event != 'schedule'
+    permissions:
+      contents: read # check out the analysed commit
+      actions: read # download artifacts from the triggering run
+      pull-requests: read # look up the pull request to decorate
+    steps:
+      # WARNING: workflow_run.head_sha may be untrusted fork code. Nothing from this
+      # checkout may be executed; it is only read by the scanner.
+      - name: Checkout the analysed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          show-progress: false
+          persist-credentials: false
+          # Required to analyse fork pull requests; safe because nothing is executed.
+          allow-unsafe-pr-checkout: true # zizmor: ignore[unsafe-checkout]
+
+      - name: Use sonar-project.properties from the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if git cat-file -e "origin/${DEFAULT_BRANCH}:sonar-project.properties" 2>/dev/null; then
+            git show "origin/${DEFAULT_BRANCH}:sonar-project.properties" > sonar-project.properties
+          else
+            rm -f sonar-project.properties
+            echo "::warning::sonar-project.properties not found on ${DEFAULT_BRANCH}; scanning with defaults."
+          fi
+
+      - name: Download coverage artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: units-coverage
+          path: ${{ runner.temp }}/sonar-coverage
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Download pull request metadata
+        if: github.event.workflow_run.event == 'pull_request'
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: pr-metadata
+          path: ${{ runner.temp }}/pr-metadata
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Prepare SonarCloud arguments
+        id: args
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event.workflow_run.event }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          # Only populated for pull requests from branches in the same repository.
+          EVENT_PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          PR_METADATA: ${{ runner.temp }}/pr-metadata/pr-metadata.json
+          COVERAGE_DIR: ${{ runner.temp }}/sonar-coverage
+          ORGANIZATION: ${{ github.repository_owner }}
+          PROJECT_KEY: ${{ format('{0}_{1}', github.repository_owner, github.event.repository.name) }}
+        run: |
+          set -euo pipefail
+
+          safe_ref='^[A-Za-z0-9._/+-]+$'
+          fail() { echo "::error::$1"; exit 1; }
+          skip() { echo "::warning::$1"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          [[ "${HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]] || fail "Unexpected head SHA: ${HEAD_SHA}"
+
+          args=(
+            "-Dsonar.organization=${ORGANIZATION}"
+            "-Dsonar.projectKey=${PROJECT_KEY}"
+            "-Dsonar.scm.revision=${HEAD_SHA}"
+          )
+
+          if [[ "${EVENT}" == "pull_request" ]]; then
+            number=""
+            if [[ -f "${PR_METADATA}" ]]; then
+              number="$(jq -r '.number // empty' "${PR_METADATA}")"
+            fi
+            number="${number:-${EVENT_PR_NUMBER}}"
+            # Never fall back to a branch analysis for pull request code: it
+            # would be attributed to the default branch.
+            [[ -n "${number}" ]] || skip "Could not determine the pull request number; skipping the scan."
+            [[ "${number}" =~ ^[0-9]+$ ]] || fail "Invalid pull request number: ${number}"
+
+            pr="$(gh api "repos/${REPO}/pulls/${number}")"
+            pr_head_sha="$(jq -r '.head.sha' <<< "${pr}")"
+            if [[ "${pr_head_sha}" != "${HEAD_SHA}" ]]; then
+              skip "PR #${number} head is ${pr_head_sha}, not ${HEAD_SHA} (outdated run or mismatched metadata); skipping."
+            fi
+            pr_base="$(jq -r '.base.ref' <<< "${pr}")"
+            pr_head="$(jq -r '.head.ref' <<< "${pr}")"
+            [[ "${pr_base}" =~ ${safe_ref} ]] || fail "Unsupported base branch name: ${pr_base}"
+            [[ "${pr_head}" =~ ${safe_ref} ]] || fail "Unsupported head branch name: ${pr_head}"
+
+            args+=(
+              "-Dsonar.pullrequest.key=${number}"
+              "-Dsonar.pullrequest.branch=${pr_head}"
+              "-Dsonar.pullrequest.base=${pr_base}"
+            )
+          elif [[ "${HEAD_BRANCH}" != "${DEFAULT_BRANCH}" ]]; then
+            # Pushes to other long-lived branches (for example stable-*). The
+            # default branch is detected automatically by the scanner.
+            [[ "${HEAD_BRANCH}" =~ ${safe_ref} ]] || fail "Unsupported branch name: ${HEAD_BRANCH}"
+            args+=("-Dsonar.branch.name=${HEAD_BRANCH}")
+          fi
+
+          mapfile -t reports < <(find "${COVERAGE_DIR}" -type f -name '*.xml' | sort)
+          [[ "${#reports[@]}" -gt 0 ]] || fail "No coverage XML found in the coverage artifact."
+          report_paths="$(IFS=,; echo "${reports[*]}")"
+          echo "Coverage reports: ${report_paths}"
+          args+=("-Dsonar.python.coverage.reportPaths=${report_paths}")
+
+          echo "Scanner arguments: ${args[*]}"
+          {
+            echo "skip=false"
+            echo "args=${args[*]}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: SonarCloud scan
+        if: steps.args.outputs.skip != 'true'
+        uses: SonarSource/sonarqube-scan-action@70bad232163b09d998ea0707ee80c0ec80798c16 # v8.5.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: ${{ steps.args.outputs.args }}

@@ -1,0 +1,65 @@
+---
+# Reusable workflow: Automation Hub certification checks plus sanity tests for
+# the ansible-core versions that certification does not cover.
+#
+# The partner-certification-checker reusable workflow runs build/import,
+# ansible-lint and sanity tests against the ansible-core versions shipped with
+# AAP (stable-2.16, stable-2.18, stable-2.20), skipping versions older than
+# requires_ansible in meta/runtime.yml. The sanity job below covers the
+# remaining (non-AAP) ansible-core versions.
+#
+# Files that are not related to the core functionality of the collection can
+# cause ansible-lint to fail. If this happens, add an .ansible-lint file that
+# excludes them, for example:
+# https://github.com/ansible-collections/partner-certification-checker/blob/main/.ansible-lint
+#
+# If sanity failures cannot be fixed and are allowed to be ignored
+# (https://docs.ansible.com/projects/lint/rules/sanity/), add them to the
+# tests/sanity/ignore-<version>.txt file of each affected ansible-core version.
+name: Certification
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  certification_check:
+    uses: ansible-collections/partner-certification-checker/.github/workflows/certification-reusable.yml@0b3575fff9a50e8057134e01862c52450648c3fc # v6.0.0
+
+  sanity:
+    name: Non-AAP Sanity (Ⓐ${{ matrix.ansible }})
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.ansible == 'devel' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ansible:
+          - stable-2.19
+          - stable-2.21
+          - stable-2.22
+          - devel
+    steps:
+      - name: Perform sanity testing
+        uses: ansible-community/ansible-test-gh-action@6ded727edb598e670ac056a8e680ca4050bac0a3 # v1.18.0
+        with:
+          ansible-core-version: ${{ matrix.ansible }}
+          testing-type: sanity
+          pull-request-change-detection: false
+          # Coverage is always very low for sanity tests and is not useful.
+          coverage: never
+
+  # Stable status check name for branch protection: "<caller job> / certification-check".
+  certification-check:
+    name: certification-check
+    if: always()
+    needs:
+      - certification_check
+      - sanity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide whether the needed jobs succeeded or failed
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
+        with:
+          jobs: ${{ toJSON(needs) }}
