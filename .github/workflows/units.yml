@@ -89,6 +89,10 @@ jobs:
           PYTHON_VERSION: ${{ matrix.versions.python }}
         run: ansible-test units --docker --python "${PYTHON_VERSION}" --coverage --color -v
 
+      - name: Export coverage data
+        working-directory: ${{ steps.collection.outputs.path }}
+        run: ansible-test coverage combine --requirements --export tests/output/coverage/
+
       - name: Show coverage report
         working-directory: ${{ steps.collection.outputs.path }}
         run: >-
